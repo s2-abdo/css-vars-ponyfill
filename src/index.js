@@ -2,8 +2,8 @@
 // =============================================================================
 import getCssData          from 'get-css-data';
 import transformCss        from './transform-css';
+import { fixVarObjNames }  from './transform-css';
 import { variableStore }   from './transform-css';
-import { name as pkgName } from '../package.json';
 
 
 // Constants & Variables
@@ -12,20 +12,21 @@ const isBrowser       = typeof window !== 'undefined';
 const isNativeSupport = isBrowser && window.CSS && window.CSS.supports && window.CSS.supports('(--a: 0)');
 
 const defaults = {
-    // Sources
+    // Targets
     rootElement  : isBrowser ? document : null,
+    shadowDOM    : false,
+    // Sources
     include      : 'style,link[rel=stylesheet]',
     exclude      : '',
+    variables    : {},    // transformCss
     // Options
     fixNestedCalc: true,  // transformCss
     onlyLegacy   : true,  // cssVars
     onlyVars     : false, // cssVars, parseCSS
     preserve     : false, // transformCss
-    shadowDOM    : false, // cssVars
     silent       : false, // cssVars
     updateDOM    : true,  // cssVars
     updateURLs   : true,  // cssVars
-    variables    : {},    // transformCss
     watch        : null,  // cssVars
     // Callbacks
     onBeforeSend() {},    // cssVars
@@ -43,12 +44,23 @@ const regex = {
     cssRootRules: /(?::root\s*{\s*[^}]*})/g,
     // CSS url(...) values
     cssUrls: /url\((?!['"]?(?:data|http|\/\/):)['"]?([^'")]*)['"]?\)/g,
+    // CSS variable declarations
+    cssVarDecls: /(?:[\s;]*)(-{2}\w[\w-]*)(?:\s*:\s*)([^;]*);/g,
     // CSS variable :root declarations and var() function values
     cssVars: /(?:(?::root\s*{\s*[^;]*;*\s*)|(?:var\(\s*))(--[^:)]+)(?:\s*[:)])/
 };
+const styleNodeAttr       = 'data-cssvars';
+const styleNodeAttrInVal  = 'in';
+const styleNodeAttrOutVal = 'out';
 
-// Mutation observer referece created via options.watch
-let cssVarsObserver  = null;
+// Counter used to track ponyfill executions and generate date attribute values
+let cssVarsCounter = 0;
+
+// Mutation observer reference created via options.watch
+let cssVarsObserver = null;
+
+// Debounce timer used with options.watch
+let debounceTimer = null;
 
 // Indicates if document-level custom property values have been parsed, stored,
 // and ready for use with options.shadowDOM
@@ -68,12 +80,18 @@ let isShadowDOMReady = false;
  * @param {object}   [options] Options object
  * @param {object}   [options.rootElement=document] Root element to traverse for
  *                   <link> and <style> nodes.
+ * @param {boolean}  [options.shadowDOM=false] Determines if shadow DOM <link>
+ *                   and <style> nodes will be processed.
  * @param {string}   [options.include="style,link[rel=stylesheet]"] CSS selector
  *                   matching <link re="stylesheet"> and <style> nodes to
  *                   process
  * @param {string}   [options.exclude] CSS selector matching <link
  *                   rel="stylehseet"> and <style> nodes to exclude from those
  *                   matches by options.include
+ * @param {object}   [options.variables] A map of custom property name/value
+ *                   pairs. Property names can omit or include the leading
+ *                   double-hyphen (—), and values specified will override
+ *                   previous values.
  * @param {boolean}  [options.fixNestedCalc=true] Removes nested 'calc' keywords
  *                   for legacy browser compatibility.
  * @param {boolean}  [options.onlyLegacy=true] Determines if the ponyfill will
@@ -85,18 +103,12 @@ let isShadowDOMReady = false;
  * @param {boolean}  [options.preserve=false] Determines if the original CSS
  *                   custom property declaration will be retained in the
  *                   ponyfill-generated CSS.
- * @param {boolean}  [options.shadowDOM=false] Determines if shadow DOM <link>
- *                   and <style> nodes will be processed.
  * @param {boolean}  [options.silent=false] Determines if warning and error
  *                   messages will be displayed on the console
  * @param {boolean}  [options.updateDOM=true] Determines if the ponyfill will
  *                   update the DOM after processing CSS custom properties
  * @param {boolean}  [options.updateURLs=true] Determines if the ponyfill will
  *                   convert relative url() paths to absolute urls.
- * @param {object}   [options.variables] A map of custom property name/value
- *                   pairs. Property names can omit or include the leading
- *                   double-hyphen (—), and values specified will override
- *                   previous values.
  * @param {boolean}  [options.watch=false] Determines if a MutationObserver will
  *                   be created that will execute the ponyfill when a <link> or
  *                   <style> DOM mutation is observed.
@@ -119,57 +131,54 @@ let isShadowDOMReady = false;
  *                   processed, legacy-compatible CSS has been generated, and
  *                   (optionally) the DOM has been updated. Passes 1) a CSS
  *                   string with CSS variable values resolved, 2) a reference to
- *                   the appended <style> node, and 3) an object containing all
- *                   custom properies names and values.
+ *                   the appended <style> node, 3) an object containing all
+ *                   custom properies names and values, and 4) the ponyfill
+ *                   execution time in milliseconds.
  *
  * @example
  *
  *   cssVars({
  *     rootElement  : document,
+ *     shadowDOM    : false,
  *     include      : 'style,link[rel="stylesheet"]',
  *     exclude      : '',
+ *     variables    : {},
  *     fixNestedCalc: true,
  *     onlyLegacy   : true,
  *     onlyVars     : false,
  *     preserve     : false,
- *     shadowDOM    : false,
  *     silent       : false,
  *     updateDOM    : true,
  *     updateURLs   : true,
- *     variables    : {
- *       // ...
- *     },
  *     watch        : false,
- *     onBeforeSend(xhr, node, url) {
- *       // ...
- *     }
- *     onSuccess(cssText, node, url) {
- *       // ...
- *     },
- *     onWarning(message) {
- *       // ...
- *     },
- *     onError(message, node) {
- *       // ...
- *     },
- *     onComplete(cssText, styleNode) {
- *       // ...
- *     }
+ *     onBeforeSend(xhr, node, url) {},
+ *     onSuccess(cssText, node, url) {},
+ *     onWarning(message) {},
+ *     onError(message, node, xhr, url) {},
+ *     onComplete(cssText, styleNode, cssVariables, benchmark) {}
  *   });
  */
 function cssVars(options = {}) {
-    const settings    = Object.assign({}, defaults, options);
-    const styleNodeId = pkgName;
+    const msgPrefix = 'cssVars(): ';
+    const settings  = Object.assign({}, defaults, options);
 
-    // Always exclude styleNodeId element, which is the generated <style> node
-    // containing previously transformed CSS.
-    settings.exclude = `#${styleNodeId}` + (settings.exclude ? `,${settings.exclude}` : '');
+    // Always exclude styleNodeAttr elements (the generated <style> nodes
+    // containing previously transformed CSS and previously processed nodes)
+    settings.exclude = `[${styleNodeAttr}]` + (settings.exclude ? `,${settings.exclude}` : '');
+
+    // If benchmark key is not availalbe, this is the first call (not recursive)
+    if (!settings.__benchmark) {
+        settings.variables = fixVarObjNames(settings.variables);
+    }
+
+    // Store benchmark start time
+    settings.__benchmark = !settings.__benchmark ? getTimeStamp() : settings.__benchmark;
 
     function handleError(message, sourceNode, xhr, url) {
         /* istanbul ignore next */
         if (!settings.silent) {
             // eslint-disable-next-line
-            console.error(`${message}\n`, sourceNode);
+            console.error(`${msgPrefix}${message}\n`, sourceNode);
         }
 
         settings.onError(message, sourceNode, xhr, url);
@@ -179,7 +188,7 @@ function cssVars(options = {}) {
         /* istanbul ignore next */
         if (!settings.silent) {
             // eslint-disable-next-line
-            console.warn(message);
+            console.warn(`${msgPrefix}${message}`);
         }
 
         settings.onWarning(message);
@@ -190,8 +199,18 @@ function cssVars(options = {}) {
         return;
     }
 
+    // Disconnect existing MutationObserver
+    if (settings.watch === false && cssVarsObserver) {
+        cssVarsObserver.disconnect();
+    }
+
+    // Add / recreate MutationObserver
+    if (settings.watch) {
+        addMutationObserver(settings);
+        cssVarsDebounced(settings, 100);
+    }
     // Verify readyState to ensure all <link> and <style> nodes are available
-    if (document.readyState !== 'loading') {
+    else if (document.readyState !== 'loading') {
         const isShadowElm = settings.shadowDOM || settings.rootElement.shadowRoot || settings.rootElement.host;
 
         // Native support
@@ -202,11 +221,7 @@ function cssVars(options = {}) {
 
                 // Set variables using native methods
                 Object.keys(settings.variables).forEach(key => {
-                    // Convert all property names to leading '--' style
-                    const prop  = `--${key.replace(/^-+/, '')}`;
-                    const value = settings.variables[key];
-
-                    targetElm.style.setProperty(prop, value);
+                    targetElm.style.setProperty(key, settings.variables[key]);
                 });
             }
         }
@@ -218,10 +233,10 @@ function cssVars(options = {}) {
                 include: defaults.include,
                 exclude: settings.exclude,
                 onSuccess(cssText, node, url) {
-                    const cssRootDecls = (cssText.match(regex.cssRootRules) || []).join('');
+                    const cssRootRules = (cssText.match(regex.cssRootRules) || []).join('');
 
                     // Return only matching :root {...} blocks
-                    return cssRootDecls || false;
+                    return cssRootRules || false;
                 },
                 onComplete(cssText, cssArray, nodeArray) {
                     // Transform CSS, which stores custom property values from
@@ -243,15 +258,6 @@ function cssVars(options = {}) {
         }
         // Ponyfill: Process CSS
         else {
-            // Add / recreate MutationObserver
-            if (settings.watch) {
-                addMutationObserver(settings, styleNodeId);
-            }
-            // Disconnect existing
-            else if (settings.watch === false && cssVarsObserver) {
-                cssVarsObserver.disconnect();
-            }
-
             getCssData({
                 rootElement: settings.rootElement,
                 include: settings.include,
@@ -291,105 +297,187 @@ function cssVars(options = {}) {
 
                     handleError(errorMsg, node, xhr, responseUrl);
                 },
-                onComplete(cssText, cssArray, nodeArray) {
-                    const cssMarker = /\/\*__CSSVARSPONYFILL-(\d+)__\*\//g;
-                    let   styleNode = null;
+                onComplete(cssText, cssArray, nodeArray = []) {
+                    const prevInNodes    = settings.rootElement.querySelectorAll(`[${styleNodeAttr}*="${styleNodeAttrInVal}"]`);
+                    const hasPrevVarDecl = Boolean(
+                        // In settings.variables
+                        Object.keys(settings.variables).some(key => {
+                            const isSameProp  = variableStore.dom.hasOwnProperty(key);
+                            const isSameValue = isSameProp && variableStore.dom[key] !== settings.variables[key];
 
-                    // Concatenate cssArray items, replacing those that do not
-                    // contain a CSS custom property declaraion or function with
-                    // a temporary marker . After the CSS is transformed, the
-                    // markers will be replaced with the matching cssArray item.
-                    // This optimization is done to avoid processing CSS that
-                    // will not change as a results of the ponyfill.
-                    cssText = cssArray.map((css, i) => regex.cssVars.test(css) ? css : `/*__CSSVARSPONYFILL-${i}__*/`).join('');
+                            return isSameProp && isSameValue;
+                        }) ||
+                        // In cssText
+                        (function hasPrevVarInCSS() {
+                            const cssRootRules = (cssText.match(regex.cssRootRules) || []).join('');
 
-                    try {
-                        cssText = transformCss(cssText, {
-                            fixNestedCalc: settings.fixNestedCalc,
-                            onlyVars     : settings.onlyVars,
-                            persist      : settings.updateDOM,
-                            preserve     : settings.preserve,
-                            variables    : settings.variables,
-                            onWarning    : handleWarning
-                        });
+                            let cssVarDeclsMatch;
 
-                        const hasKeyframes = regex.cssKeyframes.test(cssText);
+                            while((cssVarDeclsMatch = regex.cssVarDecls.exec(cssRootRules)) !== null) {
+                                const prop        = cssVarDeclsMatch[1];
+                                const value       = cssVarDeclsMatch[2];
+                                const isSameProp  = variableStore.dom.hasOwnProperty(prop);
+                                const isSameValue = isSameProp && variableStore.dom[prop] !== value;
 
-                        // Replace markers with appropriate cssArray item
-                        cssText = cssText.replace(cssMarker, (match, group1) => cssArray[group1]);
-
-                        if (settings.updateDOM && nodeArray && nodeArray.length) {
-                            const lastNode = nodeArray[nodeArray.length - 1];
-
-                            styleNode = settings.rootElement.querySelector(`#${styleNodeId}`) || document.createElement('style');
-                            styleNode.setAttribute('id', styleNodeId);
-
-                            if (styleNode.textContent !== cssText) {
-                                styleNode.textContent = cssText;
+                                if (isSameProp && isSameValue) {
+                                    return true;
+                                }
                             }
+                        })()
+                    );
 
-                            // Insert <style> element after last nodeArray item
-                            if (lastNode.nextSibling !== styleNode && lastNode.parentNode) {
-                                lastNode.parentNode.insertBefore(styleNode, lastNode.nextSibling);
-                            }
+                    // Full Update
+                    if (hasPrevVarDecl) {
+                        // Remove mark from previously processed nodes
+                        for (let i = 0, len = prevInNodes.length; i < len; i++) {
+                            prevInNodes[i].removeAttribute(styleNodeAttr);
+                        }
 
-                            if (hasKeyframes) {
-                                fixKeyframes(settings.rootElement);
+                        // Add full update flag
+                        settings.__fullUpdate = true;
+
+                        cssVars(settings);
+                    }
+                    // Progressive Update
+                    else {
+                        const cssMarker = /\/\*__CSSVARSPONYFILL-(\d+)__\*\//g;
+                        let hasKeyframesWithVars;
+
+                        // Concatenate cssArray items, replacing those that do
+                        // not contain a CSS custom property declaraion or
+                        // function with a temporary marker . After the CSS is
+                        // transformed, the markers will be replaced with the
+                        // matching cssArray item. This optimization is done to
+                        // avoid processing CSS that will not change as a
+                        // results of the ponyfill.
+                        cssText = cssArray.map((css, i) => regex.cssVars.test(css) ? css : `/*__CSSVARSPONYFILL-${i}__*/`).join('');
+
+                        try {
+                            cssText = transformCss(cssText, {
+                                fixNestedCalc: settings.fixNestedCalc,
+                                onlyVars     : settings.onlyVars,
+                                persist      : settings.updateDOM,
+                                preserve     : settings.preserve,
+                                variables    : settings.variables,
+                                onWarning    : handleWarning
+                            });
+
+                            hasKeyframesWithVars = regex.cssKeyframes.test(cssText);
+
+                            // Replace markers with appropriate cssArray item
+                            cssText = cssText.replace(cssMarker, (match, group1) => cssArray[group1]);
+                        }
+                        catch(err) {
+                            let errorThrown = false;
+
+                            // Iterate cssArray to detect CSS text and node(s)
+                            // responsibile for error.
+                            cssArray.forEach((cssText, i) => {
+                                try {
+                                    cssText = transformCss(cssText, settings);
+                                }
+                                catch(err) {
+                                    const errorNode = nodeArray[i - 0];
+
+                                    errorThrown = true;
+                                    handleError(err.message, errorNode);
+                                }
+                            });
+
+                            // In the event the error thrown was not due to
+                            // transformCss, handle the original error.
+                            /* istanbul ignore next */
+                            if (!errorThrown) {
+                                handleError(err.message || err);
                             }
                         }
-                    }
-                    catch(err) {
-                        let errorThrown = false;
 
-                        // Iterate cssArray to detect CSS text and node(s)
-                        // responsibile for error.
-                        cssArray.forEach((cssText, i) => {
-                            try {
-                                cssText = transformCss(cssText, settings);
+                        // Process shadow DOM
+                        if (settings.shadowDOM) {
+                            const elms = [
+                                settings.rootElement,
+                                ...settings.rootElement.querySelectorAll('*')
+                            ];
+
+                            // Iterates over all elements in rootElement and calls
+                            // cssVars on each shadowRoot, passing document-level
+                            // custom properties as options.variables.
+                            for (let i = 0, elm; (elm = elms[i]); ++i) {
+                                if (elm.shadowRoot && elm.shadowRoot.querySelector('style')) {
+                                    const shadowSettings = Object.assign({}, settings, {
+                                        rootElement: elm.shadowRoot,
+                                        variables  : variableStore.dom
+                                    });
+
+                                    cssVars(shadowSettings);
+                                }
                             }
-                            catch(err) {
-                                const errorNode = nodeArray[i - 0];
-
-                                errorThrown = true;
-                                handleError(err.message, errorNode);
-                            }
-                        });
-
-                        // In the event the error thrown was not due to
-                        // transformCss, handle the original error.
-                        /* istanbul ignore next */
-                        if (!errorThrown) {
-                            handleError(err.message || err);
                         }
-                    }
 
-                    // Process shadow DOM
-                    if (settings.shadowDOM) {
-                        const elms = [
-                            settings.rootElement,
-                            ...settings.rootElement.querySelectorAll('*')
-                        ];
+                        if (cssText.length || nodeArray.length) {
+                            const cssNodes  = nodeArray || settings.rootElement.querySelectorAll('link[rel*="stylesheet"],style');
+                            const lastNode  = cssNodes ? cssNodes[cssNodes.length - 1] : null;
+                            let styleNode = null;
 
-                        // Iterates over all elements in rootElement and calls
-                        // cssVars on each shadowRoot, passing document-level
-                        // custom properties as options.variables.
-                        for (let i = 0, elm; (elm = elms[i]); ++i) {
-                            if (elm.shadowRoot && elm.shadowRoot.querySelector('style')) {
-                                const shadowSettings = Object.assign({}, settings, {
-                                    rootElement: elm.shadowRoot,
-                                    variables  : variableStore.dom
+                            if (settings.updateDOM) {
+                                // Increment ponyfill counter
+                                cssVarsCounter++;
+
+                                styleNode = document.createElement('style');
+
+                                // Set in/out and job number as data attributes
+                                styleNode.setAttribute(`${styleNodeAttr}-job`, cssVarsCounter);
+                                styleNode.setAttribute(styleNodeAttr, styleNodeAttrOutVal);
+                                nodeArray.forEach(node => {
+                                    node.setAttribute(`${styleNodeAttr}-job`, cssVarsCounter);
+                                    node.setAttribute(styleNodeAttr, styleNodeAttrInVal);
                                 });
 
-                                cssVars(shadowSettings);
+                                // Insert ponyfill <style> after last node
+                                if (lastNode) {
+                                    lastNode.parentNode.insertBefore(styleNode, lastNode.nextSibling);
+                                }
+                                // Insert ponyfill <style> after last link/style node
+                                else {
+                                    const targetNode = settings.rootElement.head || settings.rootElement.body || settings.rootElement;
+
+                                    targetNode.appendChild(styleNode);
+                                }
+
+                                if (settings.__fullUpdate) {
+                                    const prevOutNodes = settings.rootElement.querySelectorAll(`[${styleNodeAttr}*="${styleNodeAttrOutVal}"]`);
+
+                                    // Remove previous output <style> nodes
+                                    for (let i = 0, len = prevOutNodes.length; i < len; i++) {
+                                        const node = prevOutNodes[i];
+
+                                        if (node !== styleNode) {
+                                            node.parentNode.removeChild(node);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Callback and get (optional) return value
+                            cssText = settings.onComplete(
+                                cssText,
+                                styleNode,
+                                JSON.parse(JSON.stringify(settings.updateDOM ? variableStore.dom : variableStore.temp)),
+                                getTimeStamp() - settings.__benchmark
+                            ) || cssText;
+
+                            if (settings.updateDOM) {
+                                styleNode.textContent = cssText;
+
+                                if (hasKeyframesWithVars) {
+                                    fixKeyframes(settings.rootElement);
+                                }
                             }
                         }
                     }
-
-                    settings.onComplete(cssText, styleNode, JSON.parse(JSON.stringify(settings.updateDOM ? variableStore.dom : variableStore.temp)));
                 }
             });
         }
-
     }
     // Delay function until DOMContentLoaded event is fired
     /* istanbul ignore next */
@@ -410,15 +498,14 @@ function cssVars(options = {}) {
  * DOM mutation is observed.
  *
  * @param {object} settings
- * @param {string} ignoreId
  */
-function addMutationObserver(settings, ignoreId) {
+function addMutationObserver(settings) {
     if (!window.MutationObserver) {
         return;
     }
 
     const isLink  = node => node.tagName === 'LINK' && (node.getAttribute('rel') || '').indexOf('stylesheet') !== -1;
-    const isStyle = node => node.tagName === 'STYLE' && (ignoreId ? node.id !== ignoreId : true);
+    const isStyle = node => node.tagName === 'STYLE' && !node.hasAttribute(styleNodeAttr);
 
     if (cssVarsObserver) {
         cssVarsObserver.disconnect();
@@ -427,29 +514,29 @@ function addMutationObserver(settings, ignoreId) {
     settings.watch = defaults.watch;
 
     cssVarsObserver = new MutationObserver(function(mutations) {
-        let isUpdateMutation = false;
-
-        for (let i = 0; i < mutations.length; i++) {
-            const mutation = mutations[i];
+        const hasCSSMutation = mutations.some((mutation) => {
+            let isCSSMutation = false;
 
             if (mutation.type === 'attributes') {
-                isUpdateMutation = isLink(mutation.target) || isStyle(mutation.target);
+                isCSSMutation = isLink(mutation.target) || isStyle(mutation.target);
             }
             else if (mutation.type === 'childList') {
                 const addedNodes   = Array.apply(null, mutation.addedNodes);
                 const removedNodes = Array.apply(null, mutation.removedNodes);
 
-                isUpdateMutation = [].concat(addedNodes, removedNodes).some(node => {
+                isCSSMutation = [].concat(addedNodes, removedNodes).some(node => {
                     const isValidLink  = isLink(node) && !node.disabled;
-                    const isValidStyle = isStyle(node) && !node.disabled && regex.cssVars.test(node.textContent);
+                    const isValidStyle = isStyle(node) && regex.cssVars.test(node.textContent);
 
                     return (isValidLink || isValidStyle);
                 });
             }
 
-            if (isUpdateMutation || (i+1 === mutations.length)) {
-                cssVars(settings);
-            }
+            return isCSSMutation;
+        });
+
+        if (hasCSSMutation) {
+            cssVarsDebounced(settings, 0);
         }
     });
 
@@ -459,6 +546,19 @@ function addMutationObserver(settings, ignoreId) {
         childList      : true,
         subtree        : true
     });
+}
+
+/**
+ * Debounces cssVars() calls
+ *
+ * @param {object} settings
+ */
+function cssVarsDebounced(settings, timeout) {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function() {
+        settings.__benchmark = null;
+        cssVars(settings);
+    }, timeout);
 }
 
 /**
@@ -521,6 +621,16 @@ function getFullUrl(url, base = location.href) {
 
     return a.href;
 }
+
+/**
+ * Returns a time stamp in milliseconds
+ *
+ * @returns {number}
+ */
+function getTimeStamp() {
+    return isBrowser && window.performance.now ? performance.now() : new Date().getTime();
+}
+
 
 // Export
 // =============================================================================

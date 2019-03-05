@@ -54,7 +54,7 @@ const variableStore       = {
  *                   warning. Passes 1) warningMessage as an argument.
  * @returns {string}
  */
-function transformVars(cssText, options = {}) {
+function transformCss(cssText, options = {}) {
     const defaults = {
         fixNestedCalc: true,
         onlyVars     : false,
@@ -63,8 +63,10 @@ function transformVars(cssText, options = {}) {
         variables    : {},
         onWarning() {}
     };
-    const settings = Object.assign({}, defaults, options);
-    const map      = settings.persist ? variableStore.dom : variableStore.temp = JSON.parse(JSON.stringify(variableStore.dom));
+    const settings = Object.assign({}, defaults, options, {
+        variables: fixVarObjNames(options.variables || {})
+    });
+    const map = settings.persist ? variableStore.dom : variableStore.temp = JSON.parse(JSON.stringify(variableStore.dom));
 
     // Convert cssText to AST (this could throw errors)
     const cssTree = parseCss(cssText, {
@@ -116,23 +118,21 @@ function transformVars(cssText, options = {}) {
         };
 
         Object.keys(settings.variables).forEach(key => {
-            // Convert all property names to leading '--' style
-            const prop  = `--${key.replace(/^-+/, '')}`;
             const value = settings.variables[key];
 
             // Persist settings.variables values
             if (settings.persist) {
-                variableStore.user[prop] = value;
+                variableStore.user[key] = value;
             }
 
             // Update map value with settings.variables value
-            if (map[prop] !== value) {
-                map[prop] = value;
+            if (map[key] !== value) {
+                map[key] = value;
 
                 // Add new declaration to newRule
                 newRule.declarations.push({
                     type    : 'declaration',
-                    property: prop,
+                    property: key,
                     value   : value
                 });
             }
@@ -233,12 +233,35 @@ function fixNestedCalc(rules) {
 }
 
 /**
+ * Converts all object property names to leading '--' style
+ *
+ * @param {object} varObj Object containing CSS custom property name:value pairs
+ * @returns {object}
+ */
+function fixVarObjNames(varObj) {
+    const userVarNames        = Object.keys(varObj);
+    const reLeadingHyphens    = /^-{2}/;
+    const hasMalformedVarName = userVarNames.some(key => !reLeadingHyphens.test(key));
+
+    if (hasMalformedVarName) {
+        varObj = userVarNames.reduce((obj, value) => {
+            const key = reLeadingHyphens.test(value) ? value : `--${value.replace(/^-+/, '')}`;
+
+            obj[key] = varObj[value];
+
+            return obj;
+        }, {});
+    }
+
+    return varObj;
+}
+/**
  * Resolves CSS var() function(s) with `map` data or fallback value(s). Returns
  * original `value` if unable to resolve.
  *
  * @param {string} value String containing CSS var() functions to resolve
  * @param {object} map CSS custom property key/values
- * @param {object} settings Settings object passed from transformVars()
+ * @param {object} settings Settings object passed from transformCss()
  * @param {string} [__recursiveFallback] Fallback when unable to resolve CSS
  *                 var() function to a map or fallback value. Allows restoring
  *                 original var() function from recursive resolveValue() calls.
@@ -258,8 +281,7 @@ function resolveValue(value, map, settings = {}, __recursiveFallback) {
         return value;
     }
 
-    const valueData    = balanced('(', ')', value);
-    const warningIntro = 'CSS transform warning:';
+    const valueData = balanced('(', ')', value);
 
     /**
      * Resolves contents of CSS custom property function
@@ -283,7 +305,7 @@ function resolveValue(value, map, settings = {}, __recursiveFallback) {
         const unresolvedFallback = __recursiveFallback || value;
 
         if (!match) {
-            settings.onWarning(`${warningIntro} variable "${name}" is undefined`);
+            settings.onWarning(`variable "${name}" is undefined`);
         }
 
         if (replacement && replacement !== 'undefined' && replacement.length > 0) {
@@ -297,7 +319,7 @@ function resolveValue(value, map, settings = {}, __recursiveFallback) {
     // No balanced brace data
     if (!valueData) {
         if (value.indexOf('var(') !== -1) {
-            settings.onWarning(`${warningIntro} missing closing ")" in the value "${value}"`);
+            settings.onWarning(`missing closing ")" in the value "${value}"`);
         }
 
         return value;
@@ -307,7 +329,7 @@ function resolveValue(value, map, settings = {}, __recursiveFallback) {
         const isEmptyVarFunc = valueData.body.trim().length === 0;
 
         if (isEmptyVarFunc) {
-            settings.onWarning(`${warningIntro} var() must contain a non-whitespace string`);
+            settings.onWarning('var() must contain a non-whitespace string');
 
             return value;
         }
@@ -332,5 +354,5 @@ function resolveValue(value, map, settings = {}, __recursiveFallback) {
 
 // Exports
 // =============================================================================
-export default transformVars;
-export { variableStore };
+export default transformCss;
+export { fixVarObjNames, variableStore };
