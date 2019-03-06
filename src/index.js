@@ -536,7 +536,8 @@ function addMutationObserver(settings) {
         });
 
         if (hasCSSMutation) {
-            cssVarsDebounced(settings, 0);
+            clearTimeout(debounceTimer);
+            cssVars(settings);
         }
     });
 

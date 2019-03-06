@@ -1355,7 +1355,8 @@ function addMutationObserver(settings) {
             return isCSSMutation;
         });
         if (hasCSSMutation) {
-            cssVarsDebounced(settings, 0);
+            clearTimeout(debounceTimer);
+            cssVars(settings);
         }
     });
     cssVarsObserver.observe(document.documentElement, {
